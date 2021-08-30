@@ -1,0 +1,288 @@
+---
+title: "First try"
+author: "Franzi"
+date: "13 7 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(plyr)
+library(dplyr)
+library(caret)
+library(mltools)
+library(data.table)
+library(doParallel)
+library(BradleyTerry2)
+```
+
+## Reading and preparing data
+
+```{r}
+test <- read.csv("~/R/Pollution/test.csv")
+train<- read.csv("~/R/Pollution/train.csv")
+summary(train)
+```
+
+The input data is the temperature, the absolute and relative humidity as well as the measurements from 5 sensors. The target values are the levels of carbon monoxide, benzene and oxides in the air.
+
+Is there any data missing?
+
+```{r}
+sum(is.na(train))
+sum(is.na(test))
+```
+
+No; that's great. Consequently, there is no need to impute data. Also the value ssem to be in reasonable ranges, i.e. there are no obvious mistakes in measurements. 
+
+We split the time stamp into several variables since it is very much likely that the pollution depends e.g. on the season and the time of the day.
+
+```{r}
+train$date_time <- as.POSIXlt(train$date_time, format="%Y-%m-%d %H:%M:%S", tz="GMT")
+test$date_time <- as.POSIXlt(test$date_time, format="%Y-%m-%d %H:%M:%S", tz="GMT")
+
+train <- mutate(train, wday=as.integer(format(train$date_time,format = "%u")),
+                month=as.integer(format(train$date_time,format = "%m")),
+               # year=as.integer(format(train$date_time,format = "%Y")),
+                hour=as.integer(format(train$date_time,format = "%H")))
+test <- mutate(test, wday=as.integer(format(test$date_time,format = "%u")),
+               month=as.integer(format(test$date_time,format = "%m")),
+              # year=as.integer(format(test$date_time,format = "%Y")),
+               hour=as.integer(format(test$date_time,format = "%H")))
+
+train<-mutate(train,night=ifelse(hour >= 22 | hour <= 6,1,0),
+              weekend=ifelse(wday %in% c(6,7),1,0),
+              satday = ifelse(wday %in% c(6:6),1,0))
+
+test<-mutate(test,night=ifelse(hour >= 22 | hour <= 6,1,0),
+              weekend=ifelse(wday %in% c(6,7),1,0),
+              satday = ifelse(wday %in% c(6:6),1,0))
+```
+
+Some of the data measured by the sensors seems weird (looking at the graphs). We create a feature to mark them accordingly
+
+```{r}
+train<-mutate(train,isodd = ifelse(sensor_4<650 & relative_humidity <35,1,0))
+test<-mutate(test,isodd = ifelse(sensor_4<650 & relative_humidity <35,1,0))
+```
+
+Moreover, we add new columns which gives a trend of the data which is measured by the sensors.
+
+```{r}
+createTrend<-function(df){
+                    df<-mutate(df,sensor_1_trend = sensor_1-shift(sensor_1,n=6,fill=df$sensor_1[1]))
+                    df<-mutate(df,sensor_2_trend = sensor_2-shift(sensor_2,n=6,fill=df$sensor_2[1]))
+                    df<-mutate(df,sensor_3_trend = sensor_3-shift(sensor_3,n=6,fill=df$sensor_3[1]))
+                    df<-mutate(df,sensor_4_trend = sensor_4-shift(sensor_4,n=6,fill=df$sensor_4[1]))
+                    df<-mutate(df,sensor_5_trend = sensor_5-shift(sensor_5,n=6,fill=df$sensor_5[1]))
+                    df
+}
+train<-createTrend(train)
+test<-createTrend(test)
+
+```
+
+## Hands on
+
+The root mean square logarithmic error (RMSLE) is going to be used to judge  the prediction. Since this metric is not one of the standard options in caret, we need to define it ourselves.
+
+```{r}
+custom_summary = function(data, lev = NULL, model = NULL) {
+                    neg <- which(data[, "obs"]<=-1)
+                    data[neg,"obs"]<- rep(-0.99, times=length(neg))
+                    
+                    neg <- which(data[, "pred"]<=-1)
+                    data[neg,"pred"]<- rep(-0.99, times=length(neg))
+                    
+                    
+                    out = rmsle(data[, "obs"], data[, "pred"])
+                    names(out) = c("rmsle")
+                    out
+}
+```
+We are going to use adaptive resampling:
+
+```{r}
+fitControl <- trainControl(
+                    method = "adaptive_cv",
+                    number = 5,  repeats = 4,               # Crossvalidation(20 Folds will be created)
+                    adaptive = list(min =3,                 # minimum number of resamples per hyperparameter
+                                    alpha =0.05,            # Confidence level for removing hyperparameters
+                                    method = "gls",# Bradly-Terry Resampling method (here you can instead also use "gls")
+                                    complete = FALSE),      # If TRUE a full resampling set will be generated 
+                    search = "random",
+                    summaryFunction = custom_summary)
+
+
+```
+Preprocessing:
+
+```{r}
+preProcessing <- preProcess(select(train,- (target_benzene | target_carbon_monoxide | target_nitrogen_oxides | date_time | wday | month | hour | isodd | weekend | night | satday)),method=c("center","scale"))
+
+trainPp<- predict(preProcessing,select(train,- date_time))
+testPp <- predict(preProcessing,select(test,-date_time))
+```
+
+
+
+<!-- Let's try a random forest.  -->
+
+<!-- ```{r} -->
+
+<!-- #tit_train_control <- trainControl(method="cv",number=10,summaryFunction = custom_summary) -->
+<!-- my_tuning_grid <- expand.grid(mtry = c(3:5)) -->
+
+<!-- rfCM <- train(target_carbon_monoxide ~ .,  -->
+<!--               data=select(train,-(date_time | target_benzene | target_nitrogen_oxides)),  -->
+<!--               method="rf",trControl=tit_train_control,  -->
+<!--               tuneGrid=my_tuning_grid,  -->
+<!--               metric="rmsle",maximize=FALSE) -->
+<!-- # varImp(rftree) -->
+<!-- rfNO <- train(target_nitrogen_oxides~ .,  -->
+<!--               data=select(train,-(date_time | target_benzene | target_carbon_monoxide)),  -->
+<!--               method="rf",trControl=tit_train_control,  -->
+<!--               tuneGrid=my_tuning_grid,  -->
+<!--               metric="rmsle",maximize=FALSE) -->
+<!-- rfB <- train(target_benzene ~ .,  -->
+<!--              data=select(train,-(date_time | target_nitrogen_oxides | target_carbon_monoxide)),  -->
+<!--              method="rf",trControl=tit_train_control,  -->
+<!--              tuneGrid=my_tuning_grid,  -->
+<!--              metric="rmsle",maximize=FALSE) -->
+
+<!-- rmsle(predict(rfNO,train),train$target_nitrogen_oxides) -->
+
+<!-- ``` -->
+Random forest with ranger:
+
+```{r}
+
+ my_tuning_grid <- expand.grid(mtry = c(3,4), #1,2,3
+                       splitrule = c("extratrees"),
+                       min.node.size = c(3,4,5)) #1,3,5
+set.seed(123)
+
+rangerCM <- train(target_carbon_monoxide ~ ., 
+              data=select(train,-(date_time | target_benzene | target_nitrogen_oxides | wday)), 
+              method="ranger",trControl=fitControl, 
+              tuneLength= 10, 
+              metric="rmsle",maximize=FALSE)
+
+rangerNO <- train(target_nitrogen_oxides~ ., 
+              data=select(train,-(date_time | target_benzene | target_carbon_monoxide  | wday | hour)), 
+              method="ranger",trControl=fitControl, 
+              tuneLength= 10, 
+              metric="rmsle",maximize=FALSE)
+rangerB <- train(target_benzene ~ ., 
+             data=select(train,-(date_time | target_nitrogen_oxides | target_carbon_monoxide | wday | hour)), 
+             method="ranger",trControl=fitControl, 
+              tuneLength= 10, 
+             metric="rmsle",maximize=FALSE)
+
+rmsle(predict(rangerCM,train),train$target_carbon_monoxide)
+rmsle(predict(rangerNO,train),train$target_nitrogen_oxides)
+rmsle(predict(rangerB,train),train$target_benzene)
+
+```
+## XGB Boost
+
+We use cross validation.
+
+```{r}
+xgbControl = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all",                                                        # save losses across all models
+#  classProbs = TRUE,                                                           # set to TRUE for AUC to be computed
+  summaryFunction = custom_summary,
+  allowParallel = TRUE
+)
+
+fitControl <- trainControl(
+                    method = "adaptive_cv",
+                    number = 5,  repeats = 4,               # Crossvalidation(20 Folds will be created)
+                    adaptive = list(min =3,                 # minimum number of resamples per hyperparameter
+                                    alpha =0.05,            # Confidence level for removing hyperparameters
+                                    method = "gls",# Bradly-Terry Resampling method (here you can instead also use "gls")
+                                    complete = FALSE),      # If TRUE a full resampling set will be generated 
+                    search = "random",
+                    summaryFunction = custom_summary)
+```
+
+
+```{r, warning=FALSE}
+xgbGrid <- expand.grid(nrounds = 300,
+                    max_depth = c(10),
+                    eta = c(0.01,0.05),
+                    gamma = c(2),
+                    subsample = c(0.3,0.4),
+                    colsample_bytree = c(0.8),
+                    min_child_weight = c(2))
+#gbmGrid <- expand.grid(n.trees = c(150, 200, 250, 300),
+#                       interaction.depth = c(2,3), shrinkage = #c(0.05, 0.1, 0.15), n.minobsinnode = c(5,10))
+
+set.seed(15)
+xgbNO <- train(target_nitrogen_oxides~ ., 
+              data=select(trainPp,-(target_benzene | target_carbon_monoxide)), 
+              method="xgbTree",trControl=xgbControl, 
+              tuneGrid=xgbGrid, 
+              #tuneLength=10,
+              verbose=FALSE,
+              metric="rmsle",maximize=FALSE)
+
+xgbB <- train(target_benzene~ ., 
+              data=select(trainPp,-(target_nitrogen_oxides | target_carbon_monoxide)), 
+              method="xgbTree",trControl=fitControl, 
+              #tuneGrid=xgbGrid, 
+              tuneLength=10, 
+              verbose=FALSE,
+              metric="rmsle",maximize=FALSE)
+
+xgbCM <- train(target_carbon_monoxide~ ., 
+              data=select(trainPp,-(target_nitrogen_oxides | target_benzene)), 
+              method="xgbTree",trControl=fitControl, 
+              #tuneGrid=xgbGrid, 
+              tuneLength=10, 
+              verbose=FALSE,
+              metric="rmsle",maximize=FALSE)
+
+rmsle(predict(xgbNO,trainPp),train$target_nitrogen_oxides)
+rmsle(predict(xgbB,trainPp),train$target_benzene)
+rmsle(predict(xgbCM,trainPp),train$target_carbon_monoxide)
+```
+
+Compare models
+
+```{r}
+resamps <- resamples(list(randomForest = rfNO, ranger=rangerNO))
+summary(resamps)
+```
+
+We apply the models to the test set.
+
+```{r}
+
+#rf
+prediction <- data.frame(date_time=test$date_time,
+                         target_carbon_monoxide=predict(rfCM,newdata=test),
+                         target_benzene=predict(rfB,newdata=test),
+                         target_nitrogen_oxides=predict(rfNO,newdata=test))
+
+#ranger+xgb mixed
+prediction <- data.frame(date_time=test$date_time,
+                         target_carbon_monoxide=predict(rangerCM,newdata=test),
+                         target_benzene=predict(rangerB,newdata=test),
+                         target_nitrogen_oxides=predict(xgbNO,newdata=testPp))
+
+#xgb
+prediction <- data.frame(date_time=test$date_time,
+                         target_carbon_monoxide=predict(xgbCM,newdata=testPp),
+                         target_benzene=predict(xgbB,newdata=testPp),
+                         target_nitrogen_oxides=predict(xgbNO,newdata=testPp))
+
+
+write.table(prediction,"~/R/Pollution/results.csv",sep=",",row.names = FALSE, quote=FALSE)
+```
